@@ -370,6 +370,17 @@ h3 {
   display: block;
   margin-bottom: 24px;
 }
+.admin-dialog {
+  width: min(640px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
+}
+.ticket-link:hover {
+  text-decoration: underline;
+}
+.ticket-filters .n-date-picker {
+  max-width: 100%;
+}
 .section-label {
   overflow-wrap: anywhere;
 }

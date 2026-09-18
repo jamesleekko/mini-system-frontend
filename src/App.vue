@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   computed,
+  onBeforeUnmount,
   onMounted,
   ref,
 } from 'vue';
@@ -10,6 +11,7 @@ import {
   NButton,
   NCard,
   NConfigProvider,
+  NDatePicker,
   NDescriptions,
   NDescriptionsItem,
   NDivider,
@@ -45,11 +47,15 @@ import {
   ticketApi,
 } from './api';
 import TicketWorkflow from './components/TicketWorkflow.vue'
+import AdminCenter from './components/AdminCenter.vue'
+import PasswordChange from './components/PasswordChange.vue'
+import { adminApi, type AdminMerchant } from './admin-api'
 
 const user = ref<User | null>(null)
 const logoutPending = ref(readLogoutPending())
 const initialized = ref(false)
-const view = ref<'list' | 'create' | 'detail'>('list')
+const view = ref<'list' | 'create' | 'detail' | 'admin'>('list')
+const passwordChangeVisible = ref(false)
 const username = ref('')
 const password = ref('')
 const busy = ref(false)
@@ -68,6 +74,10 @@ const category = ref('')
 const priority = ref('')
 const assigneeId = ref<string | null>(null)
 const groupId = ref<string | null>(null)
+const merchantId = ref<string | null>(null)
+const merchantOptions = ref<AdminMerchant[]>([])
+const dateRange = ref<[number, number] | null>(null)
+const handoverScope = ref<{ groupId?: string; userId?: string } | null>(null)
 const supportGroups = ref<Organization[]>([])
 const filterAgents = ref<AgentCandidate[]>([])
 const form = ref<CreateTicketInput>({
@@ -88,10 +98,19 @@ const canFilterAssignee = computed(() => user.value?.role === 'ADMIN'
   || (user.value?.role === 'AGENT' && (groupId.value
     ? user.value.supportGroups.some(group => group.id === groupId.value && group.role === 'LEAD')
     : hasLeadGroup.value)))
-const groupOptions = computed(() => supportGroups.value.map(group => ({ label: group.name, value: group.id })))
+const groupOptions = computed(() => {
+  const options = supportGroups.value.map(group => ({ label: group.name, value: group.id }))
+  if (groupId.value && !options.some(option => option.value === groupId.value)) {
+    options.push({ label: `客服组 #${groupId.value}（交接范围）`, value: groupId.value })
+  }
+  return options
+})
 const assigneeOptions = computed(() => [
   { label: '未分配', value: 'unassigned' },
   ...filterAgents.value.map(agent => ({ label: agent.displayName, value: String(agent.id) })),
+  ...(assigneeId.value && assigneeId.value !== 'unassigned'
+    && !filterAgents.value.some(agent => String(agent.id) === assigneeId.value)
+    ? [{ label: `账号 #${assigneeId.value}（交接范围）`, value: assigneeId.value }] : []),
 ])
 const identityLabel = computed(() => user.value?.merchant?.role === 'MERCHANT_ADMIN'
   ? '商户管理员' : hasLeadGroup.value ? '客服组长' : user.value ? roleNames[user.value.role] : '')
@@ -160,6 +179,9 @@ function resetFilters() {
   priority.value = ''
   assigneeId.value = null
   groupId.value = null
+  merchantId.value = null
+  dateRange.value = null
+  handoverScope.value = null
 }
 
 function clearProtectedData() {
@@ -168,6 +190,7 @@ function clearProtectedData() {
   total.value = 0
   supportGroups.value = []
   filterAgents.value = []
+  merchantOptions.value = []
   notice.value = ''
   fields.value = {}
 }
@@ -180,6 +203,7 @@ function clearWorkspace() {
   view.value = 'list'
   loading.value = false
   busy.value = false
+  passwordChangeVisible.value = false
 }
 
 function identityScope(identity: User | null) {
@@ -244,25 +268,39 @@ async function loadTickets() {
   const generation = ++requestGeneration
   clearProtectedData()
   view.value = 'list'
+  setLocation('#/tickets')
   loading.value = true
   error.value = ''
   try {
     if (!await refreshIdentity(generation) || generation !== requestGeneration) return
+    if (user.value?.role === 'ADMIN') {
+      const allMerchants: AdminMerchant[] = []
+      let nextPage = 1
+      while (true) {
+        const result = await adminApi.merchants({ page: nextPage++, pageSize: 100 })
+        if (generation !== requestGeneration) return
+        allMerchants.push(...result.items)
+        if (!result.items.length || allMerchants.length >= result.total) break
+      }
+      merchantOptions.value = allMerchants
+    }
     if (canFilterGroups.value) {
       const groups = await ticketApi.supportGroups()
       if (generation !== requestGeneration) return
       supportGroups.value = groups
-      if (groupId.value && !groups.some(group => group.id === groupId.value)) {
+      if (groupId.value && !groups.some(group => group.id === groupId.value)
+        && user.value?.role !== 'ADMIN') {
         groupId.value = null
         assigneeId.value = null
       }
       if (!canFilterAssignee.value) assigneeId.value = null
-      if (groupId.value && canFilterAssignee.value) {
+      if (groupId.value && canFilterAssignee.value && groups.some(group => group.id === groupId.value)) {
         const agents = await ticketApi.agents(groupId.value)
         if (generation !== requestGeneration) return
         filterAgents.value = agents
         if (assigneeId.value && assigneeId.value !== 'unassigned'
-          && !agents.some(agent => String(agent.id) === assigneeId.value)) assigneeId.value = null
+          && !agents.some(agent => String(agent.id) === assigneeId.value)
+          && user.value?.role !== 'ADMIN') assigneeId.value = null
       }
     }
     const parameters = new URLSearchParams({ page: String(page.value), pageSize: '20' })
@@ -271,8 +309,18 @@ async function loadTickets() {
       category: category.value, priority: priority.value,
       groupId: canFilterGroups.value ? groupId.value : '',
       assigneeId: canFilterAssignee.value ? assigneeId.value : '',
+      merchantId: user.value?.role === 'ADMIN' ? merchantId.value : '',
     })) {
       if (value) parameters.set(key, value)
+    }
+    if (dateRange.value) {
+      const from = new Date(dateRange.value[0])
+      const to = new Date(dateRange.value[1])
+      from.setHours(0, 0, 0, 0)
+      to.setHours(0, 0, 0, 0)
+      to.setDate(to.getDate() + 1)
+      parameters.set('createdFrom', from.toISOString())
+      parameters.set('createdTo', to.toISOString())
     }
     const result = await ticketApi.list(parameters)
     if (generation !== requestGeneration) return
@@ -297,7 +345,7 @@ async function login() {
     password.value = ''
     resetFilters()
     busy.value = false
-    await loadTickets()
+    await followLocation()
   } catch (cause) {
     if (generation === requestGeneration) showError(cause)
   } finally {
@@ -348,6 +396,7 @@ async function openTicket(id: string) {
   const generation = ++requestGeneration
   clearProtectedData()
   view.value = 'detail'
+  setLocation(`#/tickets/${encodeURIComponent(id)}`)
   loading.value = true
   error.value = ''
   try {
@@ -386,6 +435,7 @@ async function createTicket() {
     if (generation !== requestGeneration) return
     selectedTicket.value = ticket
     view.value = 'detail'
+    setLocation(`#/tickets/${encodeURIComponent(ticket.id)}`)
     notice.value = '工单 ' + ticket.number + ' 已提交'
     form.value = { title: '', description: '', category: 'BUG', priority: 'NORMAL' }
   } catch (cause) {
@@ -412,13 +462,113 @@ function handleInaccessible(cause: unknown) {
   showError(cause)
 }
 
+function setBusy(value: boolean) { busy.value = value }
+
+function setLocation(hash: string, replace = false) {
+  if (window.location.hash !== hash) {
+    window.history[replace || !window.location.hash ? 'replaceState' : 'pushState'](null, '', hash)
+  }
+}
+
+function followTicketLink(event: MouseEvent, id: string) {
+  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button !== 0) return
+  event.preventDefault()
+  void openTicket(id)
+}
+
+async function openAdmin() {
+  if (busy.value || logoutPending.value) return
+  const generation = ++requestGeneration
+  clearProtectedData()
+  loading.value = true
+  error.value = ''
+  try {
+    await refreshIdentity(generation)
+    if (generation !== requestGeneration) return
+    if (user.value?.role !== 'ADMIN') {
+      view.value = 'list'
+      setLocation('#/tickets', true)
+      error.value = '管理中心仅对平台管理员开放'
+      return
+    }
+    view.value = 'admin'
+    setLocation('#/admin')
+  } catch (cause) {
+    if (generation === requestGeneration) showError(cause)
+  } finally {
+    if (generation === requestGeneration) loading.value = false
+  }
+}
+
+async function followLocation() {
+  const hash = window.location.hash
+  if (busy.value) {
+    setLocation(view.value === 'admin' ? '#/admin' : view.value === 'detail' && selectedTicket.value
+      ? `#/tickets/${encodeURIComponent(selectedTicket.value.id)}` : '#/tickets', true)
+    return
+  }
+  if (hash === '#/admin') await openAdmin()
+  else {
+    const match = /^#\/tickets\/(\d+)$/.exec(hash)
+    if (match?.[1]) await openTicket(match[1])
+    else {
+      setLocation('#/tickets', true)
+      await loadTickets()
+    }
+  }
+}
+
+async function identityChanged() {
+  const generation = ++requestGeneration
+  try {
+    await refreshIdentity(generation)
+    if (generation === requestGeneration && user.value?.role !== 'ADMIN' && view.value === 'admin') {
+      clearWorkspace()
+      setLocation('#/tickets', true)
+    }
+  } catch (cause) {
+    if (generation === requestGeneration) showError(cause)
+  }
+}
+
+async function openHandover(scope: { groupId?: string; userId?: string }) {
+  resetFilters()
+  groupId.value = scope.groupId ?? null
+  assigneeId.value = scope.userId ?? null
+  handoverScope.value = scope
+  await loadTickets()
+}
+
+function passwordChanged() {
+  clearWorkspace()
+  user.value = null
+  password.value = ''
+  setLogoutPending(false)
+  error.value = ''
+  notice.value = '密码已修改，所有旧会话已退出。请使用新密码登录。'
+}
+
+function handleBeforeUnload(event: BeforeUnloadEvent) {
+  if (busy.value || (view.value === 'create' && (form.value.title || form.value.description))) {
+    event.preventDefault()
+  }
+}
+
+onBeforeUnmount(() => {
+  requestGeneration++
+  window.removeEventListener('hashchange', followLocation)
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+})
+
 onMounted(async () => {
+  window.addEventListener('hashchange', followLocation)
+  window.addEventListener('beforeunload', handleBeforeUnload)
   if (logoutPending.value) {
     initialized.value = true
     await logout()
     return
   }
-  await loadTickets()
+  await followLocation()
   // An absent initial session is the normal login screen, not an expired-session warning.
   if (!user.value && error.value === '登录已失效，请重新登录') error.value = ''
   initialized.value = true
@@ -435,6 +585,8 @@ onMounted(async () => {
         <NSpace v-if="user" align="center" :size="14">
           <NText depth="2">{{ user.displayName }}</NText>
           <NTag size="small" :bordered="false">{{ identityLabel }}</NTag>
+          <NButton v-if="user.role === 'ADMIN'" text :disabled="busy || loading" @click="openAdmin">管理中心</NButton>
+          <NButton text :disabled="busy || loading" @click="passwordChangeVisible = true">修改密码</NButton>
           <NButton text :disabled="busy" @click="logout">退出登录</NButton>
         </NSpace>
       </NLayoutHeader>
@@ -460,6 +612,7 @@ onMounted(async () => {
             <h1>登录工作台</h1>
           </div>
           <NCard :bordered="false" class="login-card">
+            <NAlert v-if="notice" type="success" class="form-alert">{{ notice }}</NAlert>
             <NAlert
               v-if="error"
               type="error"
@@ -501,6 +654,8 @@ onMounted(async () => {
                     ? listTitle
                     : view === 'create'
                     ? '新建工单'
+                    : view === 'admin'
+                    ? '管理中心'
                     : '工单详情'
                 }}
               </h1>
@@ -537,7 +692,15 @@ onMounted(async () => {
             >{{ notice }}</NAlert
           >
 
-          <NCard v-if="!hasAccess" :bordered="false" class="scope-card">
+          <AdminCenter
+            v-if="view === 'admin' && user.role === 'ADMIN'"
+            :user="user"
+            @inaccessible="handleInaccessible"
+            @handover="openHandover"
+            @identity-changed="identityChanged"
+            @busy="setBusy"
+          />
+          <NCard v-else-if="!hasAccess" :bordered="false" class="scope-card">
             <NEmpty description="暂未配置访问范围">
               <template #extra>
                 <p class="scope-help">请联系管理员配置商户或客服组，配置完成后刷新工作台。</p>
@@ -546,6 +709,9 @@ onMounted(async () => {
             </NEmpty>
           </NCard>
           <template v-else-if="view === 'list'">
+            <NAlert v-if="handoverScope" type="info" class="page-alert" closable @close="handoverScope = null">
+              已按选定账号或客服组筛选。请逐条处理待分配、处理中、已解决的工单，完成改派或交接后再回管理中心停用。
+            </NAlert>
             <NCard :bordered="false" class="filter-card">
               <NForm inline class="ticket-filters" @submit.prevent="filterTickets">
                 <NFormItem label="搜索"
@@ -593,6 +759,12 @@ onMounted(async () => {
                     :placeholder="groupId ? '全部处理人' : '全部 / 未分配'"
                     @update:value="filterTickets"
                 /></NFormItem>
+                <NFormItem v-if="user.role === 'ADMIN'" label="商户">
+                  <NSelect v-model:value="merchantId" :options="merchantOptions.map(item => ({ value: item.id, label: item.name + (item.enabled ? '' : '（已停用）') }))" clearable filterable placeholder="全部商户" @update:value="filterTickets" />
+                </NFormItem>
+                <NFormItem label="创建日期">
+                  <NDatePicker v-model:value="dateRange" type="daterange" clearable start-placeholder="开始日期" end-placeholder="结束日期" @update:value="filterTickets" />
+                </NFormItem>
                 <NButton attr-type="submit" secondary :loading="loading"
                   >搜索</NButton
                 >
@@ -625,11 +797,11 @@ onMounted(async () => {
                   <tbody>
                     <tr v-for="ticket in tickets" :key="ticket.id">
                       <td class="ticket-cell">
-                        <NButton
-                          text
+                        <a
+                          :href="`#/tickets/${encodeURIComponent(ticket.id)}`"
                           class="ticket-link"
-                          @click="openTicket(ticket.id)"
-                          >{{ ticket.title }}</NButton
+                          @click="event => followTicketLink(event, ticket.id)"
+                          >{{ ticket.title }}</a
                         ><NText depth="3" class="ticket-number">{{
                           ticket.number
                         }}</NText>
@@ -811,5 +983,12 @@ onMounted(async () => {
         </main>
       </NLayoutContent>
     </NLayout>
+    <PasswordChange
+      v-if="user"
+      v-model:show="passwordChangeVisible"
+      @changed="passwordChanged"
+      @inaccessible="handleInaccessible"
+      @busy="value => { busy = value }"
+    />
   </NConfigProvider>
 </template>
