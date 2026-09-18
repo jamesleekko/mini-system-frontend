@@ -30,7 +30,9 @@ import {
 } from 'naive-ui';
 
 import type {
+  AgentCandidate,
   CreateTicketInput,
+  Organization,
   Ticket,
   TicketCategory,
   TicketPriority,
@@ -64,7 +66,10 @@ const keyword = ref('')
 const status = ref('')
 const category = ref('')
 const priority = ref('')
-const assigneeId = ref('')
+const assigneeId = ref<string | null>(null)
+const groupId = ref<string | null>(null)
+const supportGroups = ref<Organization[]>([])
+const filterAgents = ref<AgentCandidate[]>([])
 const form = ref<CreateTicketInput>({
   title: '',
   description: '',
@@ -77,8 +82,19 @@ const hasAccess = computed(() => user.value?.role === 'ADMIN'
   || (user.value?.role === 'REQUESTER' && !!user.value.merchant)
   || (user.value?.role === 'AGENT' && user.value.supportGroups.length > 0))
 const canCreate = computed(() => user.value?.role === 'REQUESTER' && !!user.value.merchant)
+const hasLeadGroup = computed(() => user.value?.supportGroups.some(group => group.role === 'LEAD') ?? false)
+const canFilterGroups = computed(() => user.value?.role === 'ADMIN' || user.value?.role === 'AGENT')
+const canFilterAssignee = computed(() => user.value?.role === 'ADMIN'
+  || (user.value?.role === 'AGENT' && (groupId.value
+    ? user.value.supportGroups.some(group => group.id === groupId.value && group.role === 'LEAD')
+    : hasLeadGroup.value)))
+const groupOptions = computed(() => supportGroups.value.map(group => ({ label: group.name, value: group.id })))
+const assigneeOptions = computed(() => [
+  { label: '未分配', value: 'unassigned' },
+  ...filterAgents.value.map(agent => ({ label: agent.displayName, value: String(agent.id) })),
+])
 const identityLabel = computed(() => user.value?.merchant?.role === 'MERCHANT_ADMIN'
-  ? '商户管理员' : user.value ? roleNames[user.value.role] : '')
+  ? '商户管理员' : hasLeadGroup.value ? '客服组长' : user.value ? roleNames[user.value.role] : '')
 const scopeLabel = computed(() => user.value?.merchant?.name
   ?? (user.value?.role === 'ADMIN' ? '平台管理'
     : user.value?.supportGroups.map(group => group.name).join('、') || '暂未配置访问范围'))
@@ -102,7 +118,7 @@ const listTitle = computed(() =>
   user.value?.role === 'ADMIN'
     ? '全部工单'
     : user.value?.role === 'AGENT'
-    ? '分配给我的工单'
+    ? hasLeadGroup.value ? '客服组工单' : '分配给我的工单'
     : user.value?.merchant?.role === 'MERCHANT_ADMIN'
     ? '本商户工单'
     : '我提交的工单',
@@ -142,13 +158,16 @@ function resetFilters() {
   status.value = ''
   category.value = ''
   priority.value = ''
-  assigneeId.value = ''
+  assigneeId.value = null
+  groupId.value = null
 }
 
 function clearProtectedData() {
   tickets.value = []
   selectedTicket.value = null
   total.value = 0
+  supportGroups.value = []
+  filterAgents.value = []
   notice.value = ''
   fields.value = {}
 }
@@ -229,11 +248,29 @@ async function loadTickets() {
   error.value = ''
   try {
     if (!await refreshIdentity(generation) || generation !== requestGeneration) return
+    if (canFilterGroups.value) {
+      const groups = await ticketApi.supportGroups()
+      if (generation !== requestGeneration) return
+      supportGroups.value = groups
+      if (groupId.value && !groups.some(group => group.id === groupId.value)) {
+        groupId.value = null
+        assigneeId.value = null
+      }
+      if (!canFilterAssignee.value) assigneeId.value = null
+      if (groupId.value && canFilterAssignee.value) {
+        const agents = await ticketApi.agents(groupId.value)
+        if (generation !== requestGeneration) return
+        filterAgents.value = agents
+        if (assigneeId.value && assigneeId.value !== 'unassigned'
+          && !agents.some(agent => String(agent.id) === assigneeId.value)) assigneeId.value = null
+      }
+    }
     const parameters = new URLSearchParams({ page: String(page.value), pageSize: '20' })
     for (const [key, value] of Object.entries({
       keyword: keyword.value.trim(), status: status.value,
       category: category.value, priority: priority.value,
-      assigneeId: user.value?.role === 'ADMIN' ? assigneeId.value : '',
+      groupId: canFilterGroups.value ? groupId.value : '',
+      assigneeId: canFilterAssignee.value ? assigneeId.value : '',
     })) {
       if (value) parameters.set(key, value)
     }
@@ -292,6 +329,13 @@ async function logout() {
 async function filterTickets() {
   page.value = 1
   await loadTickets()
+}
+
+async function changeGroupFilter(value: string | null) {
+  groupId.value = value
+  assigneeId.value = null
+  filterAgents.value = []
+  await filterTickets()
 }
 
 async function changePage(nextPage: number) {
@@ -503,7 +547,7 @@ onMounted(async () => {
           </NCard>
           <template v-else-if="view === 'list'">
             <NCard :bordered="false" class="filter-card">
-              <NForm inline @submit.prevent="filterTickets">
+              <NForm inline class="ticket-filters" @submit.prevent="filterTickets">
                 <NFormItem label="搜索"
                   ><NInput
                     v-model:value="keyword"
@@ -533,14 +577,20 @@ onMounted(async () => {
                     clearable
                     @update:value="filterTickets"
                 /></NFormItem>
-                <NFormItem v-if="user.role === 'ADMIN'" label="分配情况"
+                <NFormItem v-if="canFilterGroups" label="客服组"
+                  ><NSelect
+                    :value="groupId"
+                    :options="groupOptions"
+                    clearable
+                    placeholder="全部授权客服组"
+                    @update:value="changeGroupFilter"
+                /></NFormItem>
+                <NFormItem v-if="canFilterAssignee" label="处理人"
                   ><NSelect
                     v-model:value="assigneeId"
-                    :options="[
-                      { label: '未分配', value: 'unassigned' },
-                    ]"
+                    :options="assigneeOptions"
                     clearable
-                    placeholder="全部工单"
+                    :placeholder="groupId ? '全部处理人' : '全部 / 未分配'"
                     @update:value="filterTickets"
                 /></NFormItem>
                 <NButton attr-type="submit" secondary :loading="loading"
@@ -550,6 +600,7 @@ onMounted(async () => {
                   >刷新</NButton
                 >
               </NForm>
+              <NText v-if="hasLeadGroup" depth="3" class="filter-scope-hint">可查看所管理客服组的全部工单，其他所属组仅显示分配给自己的工单。</NText>
             </NCard>
             <div class="list-summary">
               <NText strong>工单记录</NText
@@ -562,6 +613,7 @@ onMounted(async () => {
                     <tr>
                       <th>工单</th>
                       <th>所属商户</th>
+                      <th v-if="canFilterGroups">客服组</th>
                       <th>分类</th>
                       <th>优先级</th>
                       <th>状态</th>
@@ -583,6 +635,7 @@ onMounted(async () => {
                         }}</NText>
                       </td>
                       <td>{{ ticket.merchant.name }}</td>
+                      <td v-if="canFilterGroups">{{ ticket.supportGroup.name }}</td>
                       <td>{{ categoryNames[ticket.category] }}</td>
                       <td>
                         <NText
@@ -745,6 +798,7 @@ onMounted(async () => {
                 <TicketWorkflow
                   :key="selectedTicket.id"
                   :ticket="selectedTicket"
+                  :user="user"
                   @updated="ticket => { selectedTicket = ticket }"
                   @busy="value => { busy = value }"
                   @inaccessible="handleInaccessible"

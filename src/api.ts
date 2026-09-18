@@ -60,18 +60,20 @@ export interface CreateTicketInput {
   priority: TicketPriority
 }
 
-export type WorkflowAction = 'assignment' | 'reassignment' | 'resolve' | 'reject' | 'close'
+export type WorkflowAction = 'assignment' | 'reassignment' | 'transfer' | 'handover' | 'resolve' | 'reject' | 'close'
 
 export interface TimelineItem {
   id: string
   sequence: string
-  type: 'CREATED' | 'ASSIGNED' | 'REASSIGNED' | 'RESOLVED' | 'REJECTED' | 'CLOSED' | 'COMMENT'
+  type: 'CREATED' | 'ASSIGNED' | 'REASSIGNED' | 'TRANSFERRED' | 'HANDED_OVER' | 'RESOLVED' | 'REJECTED' | 'CLOSED' | 'COMMENT'
   actor: { id: string; displayName: string }
   message: string | null
   fromStatus: TicketStatus | null
   toStatus: TicketStatus | null
   fromAssignee: Ticket['assignee']
   toAssignee: Ticket['assignee']
+  fromGroup: Organization | null
+  toGroup: Organization | null
   createdAt: string
 }
 
@@ -129,11 +131,18 @@ export const ticketApi = {
     body: JSON.stringify(input),
   }),
   agents: (groupId: string) => request<AgentCandidate[]>(`/users/agents?groupId=${encodeURIComponent(groupId)}`),
+  supportGroups: () => request<Organization[]>('/support-groups'),
   assign: (id: string, version: number, assigneeId: number) => request<Ticket>(`/tickets/${id}/assignment`, {
     method: 'POST', body: JSON.stringify({ version, assigneeId }),
   }),
   reassign: (id: string, version: number, assigneeId: number, reason: string) => request<Ticket>(`/tickets/${id}/reassignment`, {
     method: 'POST', body: JSON.stringify({ version, assigneeId, reason }),
+  }),
+  transfer: (id: string, version: number, groupId: number, assigneeId: number | null, reason: string) => request<Ticket>(`/tickets/${id}/transfer`, {
+    method: 'POST', body: JSON.stringify({ version, groupId, assigneeId, reason }),
+  }),
+  handover: (id: string, version: number, groupId: number, assigneeId: number | null, reason: string) => request<Ticket>(`/tickets/${id}/handover`, {
+    method: 'POST', body: JSON.stringify({ version, groupId, assigneeId, reason }),
   }),
   resolve: (id: string, version: number, resolution: string) => request<Ticket>(`/tickets/${id}/resolve`, {
     method: 'POST', body: JSON.stringify({ version, resolution }),

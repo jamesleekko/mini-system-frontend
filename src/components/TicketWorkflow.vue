@@ -24,9 +24,11 @@ import {
 
 import type {
   AgentCandidate,
+  Organization,
   Ticket,
   TicketStatus,
   TimelineItem,
+  User,
   WorkflowAction,
 } from '../api';
 import {
@@ -34,7 +36,7 @@ import {
   ticketApi,
 } from '../api';
 
-const props = defineProps<{ ticket: Ticket }>()
+const props = defineProps<{ ticket: Ticket; user: User }>()
 const emit = defineEmits<{
   updated: [ticket: Ticket]
   busy: [value: boolean]
@@ -48,6 +50,7 @@ const saving = ref(false)
 const refreshing = ref(false)
 const loadingHistory = ref(false)
 const loadingAgents = ref(false)
+const loadingGroups = ref(false)
 const needsRefresh = ref(false)
 const error = ref('')
 const historyError = ref('')
@@ -56,16 +59,21 @@ const fieldErrors = ref<Record<string, string>>({})
 const comment = ref('')
 const message = ref('')
 const assigneeId = ref<number | null>(null)
+const groupId = ref<string | null>(null)
 const agents = ref<AgentCandidate[]>([])
+const groups = ref<Organization[]>([])
 const items = ref<TimelineItem[]>([])
 const nextBefore = ref<string | null>(null)
 let active = true
 let historyRequest = 0
 let agentRequest = 0
+let groupRequest = 0
 
 const labels: Record<WorkflowAction, string> = {
   assignment: '分配处理人',
   reassignment: '改派处理人',
+  transfer: '跨组转派',
+  handover: '交接处理人',
   resolve: '标记已解决',
   reject: '退回处理',
   close: '确认关闭',
@@ -74,6 +82,8 @@ const eventLabels: Record<TimelineItem['type'], string> = {
   CREATED: '创建工单',
   ASSIGNED: '分配处理人',
   REASSIGNED: '改派处理人',
+  TRANSFERRED: '跨组转派',
+  HANDED_OVER: '交接处理人',
   RESOLVED: '标记已解决',
   REJECTED: '退回处理',
   CLOSED: '确认关闭',
@@ -94,8 +104,17 @@ const availableActions = computed<WorkflowAction[]>(() =>
   ),
 )
 const assignment = computed(
-  () => action.value === 'assignment' || action.value === 'reassignment',
+  () => action.value === 'assignment' || action.value === 'reassignment'
+    || action.value === 'handover'
+    || (action.value === 'transfer' && props.ticket.status === 'IN_PROGRESS'),
 )
+const routing = computed(() => action.value === 'transfer' || action.value === 'handover')
+const canChooseGroup = computed(() => routing.value && props.user.role === 'ADMIN')
+const groupOptions = computed(() => groups.value
+  .filter(group => action.value !== 'transfer' || group.id !== props.ticket.supportGroup.id)
+  .map(group => ({ label: group.name, value: group.id })))
+const targetGroupName = computed(() => groups.value.find(group => group.id === groupId.value)?.name
+  ?? (groupId.value === props.ticket.supportGroup.id ? props.ticket.supportGroup.name : '目标客服组'))
 const messageField = computed(() =>
   action.value === 'resolve' ? 'resolution' : 'reason',
 )
@@ -104,6 +123,10 @@ const messageLabel = computed(() =>
     ? '解决说明'
     : action.value === 'reject'
     ? '退回原因'
+    : action.value === 'transfer'
+    ? '转派原因'
+    : action.value === 'handover'
+    ? '交接原因'
     : '改派原因',
 )
 const maxLength = computed(() =>
@@ -111,7 +134,8 @@ const maxLength = computed(() =>
 )
 const agentOptions = computed(() =>
   agents.value
-    .filter((agent) => String(agent.id) !== props.ticket.assignee?.id)
+    .filter((agent) => groupId.value !== props.ticket.supportGroup.id
+      || String(agent.id) !== props.ticket.assignee?.id)
     .map((agent) => ({ label: agent.displayName, value: agent.id })),
 )
 const locked = computed(() => saving.value || refreshing.value)
@@ -126,6 +150,7 @@ function fail(cause: unknown) {
     items.value = []
     nextBefore.value = null
     agents.value = []
+    groups.value = []
     comment.value = ''
     message.value = ''
     action.value = null
@@ -180,6 +205,43 @@ function refresh() {
   emit('refresh')
 }
 
+async function loadActionAgents() {
+  const generation = ++agentRequest
+  const currentAction = action.value
+  const targetGroupId = groupId.value
+  agents.value = []
+  assigneeId.value = null
+  loadingAgents.value = false
+  if (!currentAction || !assignment.value || !targetGroupId) return
+  loadingAgents.value = true
+  try {
+    const result = await ticketApi.agents(targetGroupId)
+    if (active && generation === agentRequest && action.value === currentAction
+      && groupId.value === targetGroupId) agents.value = result
+  } catch (cause) {
+    if (active && generation === agentRequest && action.value === currentAction) fail(cause)
+  } finally {
+    if (active && generation === agentRequest) loadingAgents.value = false
+  }
+}
+
+async function changeGroup(value: string | null) {
+  groupId.value = value
+  fieldErrors.value = {}
+  await loadActionAgents()
+}
+
+function closeAction() {
+  if (locked.value) return
+  action.value = null
+  agentRequest++
+  groupRequest++
+  agents.value = []
+  groups.value = []
+  loadingAgents.value = false
+  loadingGroups.value = false
+}
+
 async function openAction(value: WorkflowAction) {
   if (
     locked.value ||
@@ -187,39 +249,48 @@ async function openAction(value: WorkflowAction) {
     !availableActions.value.includes(value)
   )
     return
-  const generation = ++agentRequest
+  const generation = ++groupRequest
+  agentRequest++
   action.value = value
   actionVersion.value = props.ticket.version
   message.value = ''
   assigneeId.value = null
+  groupId.value = value === 'transfer' ? null : props.ticket.supportGroup.id
+  groups.value = []
+  agents.value = []
+  loadingAgents.value = false
+  loadingGroups.value = false
   error.value = ''
   success.value = ''
   fieldErrors.value = {}
-  if (assignment.value) {
-    agents.value = []
-    loadingAgents.value = true
+  if (canChooseGroup.value) {
+    loadingGroups.value = true
     try {
-      const result = await ticketApi.agents(props.ticket.supportGroup.id)
-      if (active && generation === agentRequest && action.value === value)
-        agents.value = result
+      const result = await ticketApi.supportGroups()
+      if (!active || generation !== groupRequest || action.value !== value) return
+      groups.value = result
+      if (groupId.value && !result.some(group => group.id === groupId.value)) groupId.value = null
     } catch (cause) {
-      if (active && generation === agentRequest && action.value === value)
-        fail(cause)
+      if (active && generation === groupRequest && action.value === value) fail(cause)
+      return
     } finally {
-      if (active && generation === agentRequest) loadingAgents.value = false
+      if (active && generation === groupRequest) loadingGroups.value = false
     }
   }
+  if (active && generation === groupRequest && action.value === value) await loadActionAgents()
 }
 
 async function submitAction() {
   if (
     !action.value ||
     locked.value ||
+    loadingAgents.value || loadingGroups.value ||
     needsRefresh.value ||
     !availableActions.value.includes(action.value)
   )
     return
   fieldErrors.value = {}
+  if (routing.value && !groupId.value) fieldErrors.value.groupId = '请选择目标客服组'
   if (assignment.value && assigneeId.value === null)
     fieldErrors.value.assigneeId = '请选择处理人'
   if (action.value !== 'assignment' && action.value !== 'close') {
@@ -249,6 +320,12 @@ async function submitAction() {
           assigneeId.value!,
           message.value,
         )
+        break
+      case 'transfer':
+        result = await ticketApi.transfer(id, version, Number(groupId.value), assigneeId.value, message.value)
+        break
+      case 'handover':
+        result = await ticketApi.handover(id, version, Number(groupId.value), assigneeId.value, message.value)
         break
       case 'resolve':
         result = await ticketApi.resolve(id, version, message.value)
@@ -316,6 +393,7 @@ onUnmounted(() => {
   active = false
   historyRequest++
   agentRequest++
+  groupRequest++
 })
 </script>
 
@@ -419,11 +497,17 @@ onUnmounted(() => {
             }}{{ statuses[item.toStatus] }}
           </div>
           <div
-            v-if="item.type === 'ASSIGNED' || item.type === 'REASSIGNED'"
+            v-if="item.fromGroup || item.toGroup"
+            class="timeline-change"
+          >
+            客服组：{{ item.fromGroup?.name ?? '未设置' }} → {{ item.toGroup?.name ?? '未设置' }}
+          </div>
+          <div
+            v-if="['ASSIGNED', 'REASSIGNED', 'TRANSFERRED', 'HANDED_OVER'].includes(item.type)"
             class="timeline-change"
           >
             {{ item.fromAssignee?.displayName ?? '未分配' }} →
-            {{ item.toAssignee?.displayName }}
+            {{ item.toAssignee?.displayName ?? '未分配' }}
           </div>
           <p v-if="item.message" class="timeline-message">{{ item.message }}</p>
         </NTimelineItem>
@@ -453,7 +537,7 @@ onUnmounted(() => {
     :close-on-esc="!locked"
     @update:show="
       (value) => {
-        if (!value && !locked) action = null
+        if (!value) closeAction()
       }
     "
   >
@@ -461,9 +545,30 @@ onUnmounted(() => {
       error
     }}</NAlert>
     <NForm @submit.prevent="submitAction">
+      <NAlert v-if="routing" type="info" class="page-alert">
+        <template v-if="action === 'transfer' && ticket.status === 'PENDING'">转派后仍为待分配，由目标客服组安排处理人。</template>
+        <template v-else-if="action === 'handover'">为不可用的原处理人安排交接，保留工单当前状态。{{ user.role === 'ADMIN' ? '可选择目标客服组。' : '仅可交接给当前客服组成员。' }}</template>
+        <template v-else>选择目标客服组及处理人，转派后继续处理。</template>
+      </NAlert>
+      <NFormItem
+        v-if="canChooseGroup"
+        label="目标客服组"
+        required
+        :feedback="fieldErrors.groupId"
+        :validation-status="fieldErrors.groupId ? 'error' : undefined"
+      >
+        <NSelect
+          :value="groupId"
+          :options="groupOptions"
+          :loading="loadingGroups"
+          :disabled="locked || loadingGroups"
+          placeholder="请选择目标客服组"
+          @update:value="changeGroup"
+        />
+      </NFormItem>
       <NFormItem
         v-if="assignment"
-        :label="`${ticket.supportGroup.name} · 处理人`"
+        :label="`${targetGroupName} · 处理人`"
         required
         :feedback="fieldErrors.assigneeId"
         :validation-status="fieldErrors.assigneeId ? 'error' : undefined"
@@ -472,10 +577,13 @@ onUnmounted(() => {
           v-model:value="assigneeId"
           :options="agentOptions"
           :loading="loadingAgents"
-          :disabled="locked"
+          :disabled="locked || loadingAgents || loadingGroups || !groupId"
           placeholder="请选择处理人"
         />
       </NFormItem>
+      <NText v-if="assignment && groupId && !loadingAgents && !loadingGroups && !agentOptions.length" depth="3" class="candidate-empty">
+        当前客服组没有可选处理人，请联系管理员核对成员状态。
+      </NText>
       <NFormItem
         v-if="action && action !== 'assignment' && action !== 'close'"
         :label="messageLabel"
@@ -496,7 +604,7 @@ onUnmounted(() => {
         >确认问题已解决？关闭后无法继续评论或重新打开。</NAlert
       >
       <NSpace justify="end">
-        <NButton :disabled="locked" @click="action = null">取消</NButton>
+        <NButton :disabled="locked" @click="closeAction">取消</NButton>
         <NButton
           v-if="needsRefresh"
           type="primary"
@@ -510,7 +618,7 @@ onUnmounted(() => {
           attr-type="submit"
           type="primary"
           :loading="saving"
-          :disabled="locked || loadingAgents"
+          :disabled="locked || loadingAgents || loadingGroups"
         >
           {{ action ? labels[action] : '确认' }}
         </NButton>
@@ -541,6 +649,10 @@ onUnmounted(() => {
 }
 .comment-form {
   margin-top: 20px;
+}
+.candidate-empty {
+  display: block;
+  margin: -8px 0 20px;
 }
 .ticket-timeline {
   min-height: 80px;

@@ -173,6 +173,20 @@ h3 {
 .filter-card .n-button {
   margin: 0 0 10px;
 }
+.ticket-filters {
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0 16px;
+}
+.ticket-filters .n-form-item {
+  margin-right: 0;
+}
+.filter-scope-hint {
+  display: block;
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.7;
+}
 .list-summary {
   display: flex;
   align-items: center;
