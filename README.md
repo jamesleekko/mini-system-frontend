@@ -1,5 +1,35 @@
-# Vue 3 + TypeScript + Vite
+# 微型工单系统前端
 
-This template should help get you started developing with Vue 3 and TypeScript in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+这是微型工单系统的 Vue 3 前端，对应后端项目：../mini-system-backend。
 
-Learn more about the recommended Project Setup and IDE Support in the [Vue Docs TypeScript Guide](https://vuejs.org/guide/typescript/overview.html#project-setup).
+当前已接入 M6.3：登录与会话恢复、商户身份展示、工单列表、搜索筛选、分页、详情、创建、分配与改派、评论、解决、退回及关闭。
+
+## M6.3 访问范围
+
+- 商户普通成员显示“我提交的工单”；商户管理员显示“本商户工单”，并可按服务端许可回复、退回或关闭本商户其他成员的工单。
+- 工单创建只提交标题、描述、分类和优先级，商户与默认客服组由服务端确定。页面展示当前商户，不能自行指定其他商户。
+- 客服仍显示“分配给我的工单”。本阶段未开放组长查看全组、组内分派或跨组转派，相关能力属于 M6.4。
+- 无有效商户或客服组的账号显示“暂未配置访问范围”，不显示创建入口；管理员配置后可点击“刷新工作台”重新获取身份。
+- 操作按钮使用工单响应的 `allowedActions`。分配候选人仅在打开分配弹窗时，按当前工单的 `supportGroup.id` 查询；不预加载全平台客服。管理员列表的分配筛选支持全部、未分配。
+- 列表、详情及其刷新先重新获取 `/auth/me`。请求失败、权限丢失或退出时清除受保护的数据；请求代次检查阻止旧请求回填缓存，列表总数与组织身份一起刷新。
+- 商户默认路由不可用时提示联系管理员并保留创建表单；退回时处理人失效会提示等待交接并保留退回原因。
+
+服务端仍是权限判断的最终依据。前端展示身份和隐藏入口不能替代商户数据隔离；本阶段应在独立测试库验证，不能仅凭前端升级开放多商户流量。
+
+## 启动
+
+先启动后端，再启动前端：
+
+    cd ../mini-system-backend
+    mvn spring-boot:run
+
+    cd ../mini-system-frontend
+    pnpm dev
+
+Vite 会将 /api 请求代理到 http://localhost:8080。前端不保存登录 Token，认证由后端 HttpOnly Cookie 管理。
+
+开发账号使用后端显式初始化的 M6 商户、客服及管理员账号，初始化方法见后端 README.md。旧账号若尚未核实组织归属，将显示无访问范围；不要通过重置日常数据库绕过归属核对。
+
+## 验证
+
+    pnpm run build
